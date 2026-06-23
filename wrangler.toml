@@ -1,5 +1,5 @@
 name = "nodewarden"
-main  主要角色 = "src/index.ts"
+main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [build]

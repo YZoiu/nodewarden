@@ -22,7 +22,10 @@ import {
   type AuditLogListOptions,
   createAuditLog as createStoredAuditLog,
   clearAuditLogs as clearStoredAuditLogs,
+  assignInviteUsedBy as assignStoredInviteUsedBy,
   createInvite as createStoredInvite,
+  deleteInvite as deleteStoredInvite,
+  deleteInvalidInvites as deleteStoredInvalidInvites,
   deleteAllInvites as deleteStoredInvites,
   getInvite as findStoredInvite,
   listAuditLogs as listStoredAuditLogs,
@@ -30,7 +33,7 @@ import {
   markInviteUsed as markStoredInviteUsed,
   pruneAuditLogs as pruneStoredAuditLogs,
   pruneAuditLogsToMax as pruneStoredAuditLogsToMax,
-  revokeInvite as revokeStoredInvite,
+  revertInviteUsed as revertStoredInviteUsed,
 } from './storage-admin-repo';
 import {
   bulkDeleteFolders as deleteStoredFolders,
@@ -38,6 +41,7 @@ import {
   deleteFolder as deleteStoredFolder,
   getAllFolders as listStoredFolders,
   getFolder as findStoredFolder,
+  getFolderForUser as findStoredFolderForUser,
   getFoldersPage as listStoredFoldersPage,
   saveFolder as saveStoredFolder,
 } from './storage-folder-repo';
@@ -50,6 +54,7 @@ import {
   bulkUnarchiveCiphers as unarchiveStoredCiphers,
   getAllCiphers as listStoredCiphers,
   getCipher as findStoredCipher,
+  getCipherForUser as findStoredCipherForUser,
   getCiphersByIds as listStoredCiphersByIds,
   getCiphersPage as listStoredCiphersPage,
   saveCipher as saveStoredCipher,
@@ -57,10 +62,13 @@ import {
 } from './storage-cipher-repo';
 import {
   addAttachmentToCipher as attachStoredAttachmentToCipher,
+  addAttachmentToCipherForUser as attachStoredAttachmentToCipherForUser,
   bulkDeleteAttachmentsByIds as deleteStoredAttachmentsByIds,
   deleteAllAttachmentsByCipher as deleteStoredAttachmentsByCipher,
   deleteAttachment as deleteStoredAttachment,
+  deleteAttachmentForUser as deleteStoredAttachmentForUser,
   getAttachment as findStoredAttachment,
+  getAttachmentForUser as findStoredAttachmentForUser,
   getAttachmentsByCipher as listStoredAttachmentsByCipher,
   getAttachmentsByCipherIds as listStoredAttachmentsByCipherIds,
   getAttachmentsByUserId as listStoredAttachmentsByUserId,
@@ -72,6 +80,7 @@ import {
   deleteSend as deleteStoredSend,
   getAllSends as listStoredSends,
   getSend as findStoredSend,
+  getSendForUser as findStoredSendForUser,
   getSendsByIds as listStoredSendsByIds,
   getSendsPage as listStoredSendsPage,
   incrementSendAccessCount as incrementStoredSendAccessCount,
@@ -100,6 +109,7 @@ import {
   isKnownDevice as getKnownStoredDevice,
   isKnownDeviceByEmail as getKnownStoredDeviceByEmail,
   saveTrustedTwoFactorDeviceToken as saveStoredTrustedDeviceToken,
+  rotateDeviceSessionStamp as rotateStoredDeviceSessionStamp,
   touchDeviceLastSeen as touchStoredDeviceLastSeen,
   upsertDevice as saveStoredDevice,
   updateDeviceName as updateStoredDeviceName,
@@ -111,6 +121,7 @@ import {
 import {
   createAuthRequest as createStoredAuthRequest,
   getAuthRequestById as findStoredAuthRequestById,
+  getAuthRequestByIdForUser as findStoredAuthRequestByIdForUser,
   listAuthRequestsByUserId as listStoredAuthRequestsByUserId,
   listPendingAuthRequestsByUserId as listStoredPendingAuthRequestsByUserId,
   markAuthRequestAuthenticated as markStoredAuthRequestAuthenticated,
@@ -121,6 +132,9 @@ import {
   ensureUsedAttachmentDownloadTokenTable as ensureStoredAttachmentTokenTable,
   consumeAttachmentDownloadToken as consumeStoredAttachmentDownloadToken,
 } from './storage-attachment-token-repo';
+import {
+  consumeTotpLoginCounter as consumeStoredTotpLoginCounter,
+} from './storage-totp-replay-repo';
 import {
   getRevisionDate as getStoredRevisionDate,
   updateRevisionDate as updateStoredRevisionDate,
@@ -148,8 +162,8 @@ const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
 // Bump this whenever src/services/storage-schema.ts or migrations/0001_init.sql
 // changes. Existing D1 installs only rerun ensureStorageSchema() when this value
 // differs from config.schema.version.
-const STORAGE_SCHEMA_VERSION = '2026-06-22-push-notifications';
-const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests'] as const;
+const STORAGE_SCHEMA_VERSION = '2026-07-05-passkey-2fa';
+const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests', 'totp_login_replays'] as const;
 
 // D1-backed storage.
 // Contract:
@@ -162,10 +176,13 @@ export class StorageService {
   private static schemaVerified = false;
   private static lastRefreshTokenCleanupAt = 0;
   private static lastAttachmentTokenCleanupAt = 0;
+  private static lastTotpReplayCleanupAt = 0;
   private static readonly MAX_D1_SQL_VARIABLES = 100;
 
   private static readonly REFRESH_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.refreshTokenCleanupIntervalMs;
   private static readonly ATTACHMENT_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.attachmentTokenCleanupIntervalMs;
+  private static readonly TOTP_REPLAY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+  private static readonly TOTP_REPLAY_MARKER_TTL_MS = 5 * 60 * 1000;
   private static readonly PERIODIC_CLEANUP_PROBABILITY = LIMITS.cleanup.cleanupProbability;
 
   constructor(private db: D1Database) {}
@@ -313,8 +330,20 @@ export class StorageService {
     return markStoredInviteUsed(this.db, code, userId);
   }
 
-  async revokeInvite(code: string): Promise<boolean> {
-    return revokeStoredInvite(this.db, code);
+  async assignInviteUsedBy(code: string, userId: string): Promise<boolean> {
+    return assignStoredInviteUsedBy(this.db, code, userId);
+  }
+
+  async revertInviteUsed(code: string, userId: string): Promise<boolean> {
+    return revertStoredInviteUsed(this.db, code, userId);
+  }
+
+  async deleteInvite(code: string): Promise<boolean> {
+    return deleteStoredInvite(this.db, code);
+  }
+
+  async deleteInvalidInvites(): Promise<number> {
+    return deleteStoredInvalidInvites(this.db);
   }
 
   async deleteAllInvites(): Promise<number> {
@@ -370,8 +399,11 @@ export class StorageService {
     await saveStoredAccountPasskeyCredential(this.db, this.safeBind.bind(this), credential);
   }
 
-  async getAccountPasskeyCredentialsByUserId(userId: string): Promise<AccountPasskeyCredential[]> {
-    return listStoredAccountPasskeyCredentialsByUserId(this.db, userId);
+  async getAccountPasskeyCredentialsByUserId(
+    userId: string,
+    purpose: AccountPasskeyCredential['purpose'] = 'login'
+  ): Promise<AccountPasskeyCredential[]> {
+    return listStoredAccountPasskeyCredentialsByUserId(this.db, userId, purpose);
   }
 
   async getAccountPasskeyCredentialById(userId: string, id: string): Promise<AccountPasskeyCredential | null> {
@@ -382,8 +414,11 @@ export class StorageService {
     return findStoredAccountPasskeyCredentialByCredentialId(this.db, credentialId);
   }
 
-  async countAccountPasskeyCredentialsByUserId(userId: string): Promise<number> {
-    return countStoredAccountPasskeyCredentialsByUserId(this.db, userId);
+  async countAccountPasskeyCredentialsByUserId(
+    userId: string,
+    purpose: AccountPasskeyCredential['purpose'] = 'login'
+  ): Promise<number> {
+    return countStoredAccountPasskeyCredentialsByUserId(this.db, userId, purpose);
   }
 
   async updateAccountPasskeyCounter(
@@ -414,8 +449,12 @@ export class StorageService {
     );
   }
 
-  async deleteAccountPasskeyCredential(userId: string, id: string): Promise<boolean> {
-    return deleteStoredAccountPasskeyCredential(this.db, userId, id);
+  async deleteAccountPasskeyCredential(
+    userId: string,
+    id: string,
+    purpose: AccountPasskeyCredential['purpose'] = 'login'
+  ): Promise<boolean> {
+    return deleteStoredAccountPasskeyCredential(this.db, userId, id, purpose);
   }
 
   async saveAccountPasskeyChallenge(challenge: AccountPasskeyChallenge): Promise<void> {
@@ -435,6 +474,10 @@ export class StorageService {
 
   async getCipher(id: string): Promise<Cipher | null> {
     return findStoredCipher(this.db, id);
+  }
+
+  async getCipherForUser(id: string, userId: string): Promise<Cipher | null> {
+    return findStoredCipherForUser(this.db, id, userId);
   }
 
   async saveCipher(cipher: Cipher): Promise<void> {
@@ -487,6 +530,10 @@ export class StorageService {
     return findStoredFolder(this.db, id);
   }
 
+  async getFolderForUser(id: string, userId: string): Promise<Folder | null> {
+    return findStoredFolderForUser(this.db, id, userId);
+  }
+
   async saveFolder(folder: Folder): Promise<void> {
     await saveStoredFolder(this.db, folder);
   }
@@ -525,12 +572,20 @@ export class StorageService {
     return findStoredAttachment(this.db, id);
   }
 
+  async getAttachmentForUser(id: string, userId: string): Promise<Attachment | null> {
+    return findStoredAttachmentForUser(this.db, id, userId);
+  }
+
   async saveAttachment(attachment: Attachment): Promise<void> {
     await saveStoredAttachment(this.db, this.safeBind.bind(this), attachment);
   }
 
   async deleteAttachment(id: string): Promise<void> {
     await deleteStoredAttachment(this.db, id);
+  }
+
+  async deleteAttachmentForUser(id: string, userId: string): Promise<void> {
+    await deleteStoredAttachmentForUser(this.db, id, userId);
   }
 
   async bulkDeleteAttachmentsByIds(ids: string[]): Promise<void> {
@@ -551,6 +606,10 @@ export class StorageService {
 
   async addAttachmentToCipher(cipherId: string, attachmentId: string): Promise<void> {
     await attachStoredAttachmentToCipher(this.db, cipherId, attachmentId);
+  }
+
+  async addAttachmentToCipherForUser(cipherId: string, attachmentId: string, userId: string): Promise<void> {
+    await attachStoredAttachmentToCipherForUser(this.db, cipherId, attachmentId, userId);
   }
 
   async deleteAllAttachmentsByCipher(cipherId: string): Promise<void> {
@@ -611,6 +670,10 @@ export class StorageService {
 
   async getSend(id: string): Promise<Send | null> {
     return findStoredSend(this.db, id);
+  }
+
+  async getSendForUser(id: string, userId: string): Promise<Send | null> {
+    return findStoredSendForUser(this.db, id, userId);
   }
 
   async saveSend(send: Send): Promise<void> {
@@ -699,6 +762,10 @@ export class StorageService {
     return findStoredDevice(this.db, userId, deviceIdentifier);
   }
 
+  async rotateDeviceSessionStamp(userId: string, deviceIdentifier: string, sessionStamp: string): Promise<boolean> {
+    return rotateStoredDeviceSessionStamp(this.db, userId, deviceIdentifier, sessionStamp);
+  }
+
   async updateDeviceKeys(
     userId: string,
     deviceIdentifier: string,
@@ -762,6 +829,10 @@ export class StorageService {
     return findStoredAuthRequestById(this.db, id);
   }
 
+  async getAuthRequestByIdForUser(id: string, userId: string): Promise<AuthRequestRecord | null> {
+    return findStoredAuthRequestByIdForUser(this.db, id, userId);
+  }
+
   async listAuthRequestsByUserId(userId: string): Promise<AuthRequestRecord[]> {
     return listStoredAuthRequestsByUserId(this.db, userId);
   }
@@ -821,6 +892,24 @@ export class StorageService {
 
   async getTrustedTwoFactorDeviceTokenUserId(token: string, deviceIdentifier: string): Promise<string | null> {
     return findStoredTrustedTokenUserId(this.db, this.trustedTwoFactorTokenKey.bind(this), token, deviceIdentifier);
+  }
+
+  async consumeTotpLoginCounter(userId: string, timeCounter: number, consumedAtMs: number = Date.now()): Promise<boolean> {
+    if (!Number.isSafeInteger(timeCounter) || timeCounter < 0) return false;
+    const result = await consumeStoredTotpLoginCounter(
+      this.db,
+      this.shouldRunPeriodicCleanup.bind(this),
+      StorageService.lastTotpReplayCleanupAt,
+      StorageService.TOTP_REPLAY_CLEANUP_INTERVAL_MS,
+      userId,
+      timeCounter,
+      consumedAtMs,
+      StorageService.TOTP_REPLAY_MARKER_TTL_MS
+    );
+    if (result.cleanedUpAt !== null) {
+      StorageService.lastTotpReplayCleanupAt = result.cleanedUpAt;
+    }
+    return result.consumed;
   }
 
   // --- Revision dates ---

@@ -11,6 +11,7 @@ import RecoverTwoFactorPage from '@/components/RecoverTwoFactorPage';
 import JwtWarningPage from '@/components/JwtWarningPage';
 import {
   createAuthedFetch,
+  deriveLoginHash,
   getAuthorizedDevices,
   clearProfileSnapshot,
   getCurrentDeviceIdentifier,
@@ -19,7 +20,7 @@ import {
   loadProfileSnapshot,
   saveProfileSnapshot,
   revokeCurrentSession,
-  getTotpStatus,
+  getTwoFactorProviderStatus,
   getVaultRevisionDate,
   saveSession,
   stripProfileSecrets,
@@ -57,6 +58,7 @@ import {
   type PendingPasskeyPassword,
   type PendingTotp,
 } from '@/lib/app-auth';
+import { assertTwoFactorPasskey } from '@/lib/account-passkeys';
 import useAccountSecurityActions from '@/hooks/useAccountSecurityActions';
 import useAdminActions from '@/hooks/useAdminActions';
 import useBackupActions from '@/hooks/useBackupActions';
@@ -151,6 +153,8 @@ const SIGNALR_UPDATE_TYPE_AUTH_REQUEST = 15;
 const SIGNALR_UPDATE_TYPE_AUTH_REQUEST_RESPONSE = 16;
 const SIGNALR_UPDATE_TYPE_DEVICE_STATUS = 101;
 const SIGNALR_UPDATE_TYPE_BACKUP_RESTORE_PROGRESS = 102;
+const TWO_FACTOR_PROVIDER_YUBIKEY = 3;
+const TWO_FACTOR_PROVIDER_WEBAUTHN = 7;
 
 type ThemePreference = 'system' | 'light' | 'dark';
 type LockTimeoutMinutes = 0 | 1 | 5 | 15 | 30;
@@ -224,6 +228,7 @@ export default function App() {
     hint: null,
   });
   const [inviteCodeFromUrl, setInviteCodeFromUrl] = useState(initialInviteCode);
+  const [hashPathRaw, setHashPathRaw] = useState(() => (typeof window !== 'undefined' ? window.location.hash || '' : ''));
   const [unlockPassword, setUnlockPassword] = useState('');
   const [pendingTotp, setPendingTotp] = useState<PendingTotp | null>(null);
   const [pendingTotpMode, setPendingTotpMode] = useState<'login' | 'unlock' | null>(null);
@@ -237,6 +242,7 @@ export default function App() {
   const [disableTotpPassword, setDisableTotpPassword] = useState('');
   const [disableTotpSubmitting, setDisableTotpSubmitting] = useState(false);
   const [authRequestDialogDismissedId, setAuthRequestDialogDismissedId] = useState<string | null>(null);
+  const [authRequestDialogSelectedId, setAuthRequestDialogSelectedId] = useState<string | null>(null);
   const [authRequestSubmittingId, setAuthRequestSubmittingId] = useState<string | null>(null);
   const [recoverValues, setRecoverValues] = useState({ email: '', password: '', recoveryCode: '' });
   const [themePreference, setThemePreference] = useState<ThemePreference>(() => readThemePreference());
@@ -264,6 +270,11 @@ export default function App() {
   const refreshAuthorizedDevicesRef = useRef<() => Promise<void>>(async () => {});
   const refreshPendingAuthRequestsRef = useRef<() => Promise<void>>(async () => {});
   const repairAttemptRef = useRef<string>('');
+  const loginScopedBackupRepairAuthRef = useRef<{
+    accessToken: string;
+    masterPasswordHash?: string | null;
+    userVerificationToken?: string | null;
+  } | null>(null);
   const uriChecksumRepairAttemptRef = useRef<string>('');
   const pendingVaultCoreQueryRefreshRef = useRef<Promise<{ data?: VaultCoreSnapshot } | unknown> | null>(null);
   const pendingVaultCoreRefreshRef = useRef<Promise<unknown> | null>(null);
@@ -285,15 +296,16 @@ export default function App() {
   }, [pushToast]);
 
   useEffect(() => {
-    const syncInviteFromUrl = () => {
+    const syncUrlState = () => {
       setInviteCodeFromUrl(readInviteCodeFromUrl());
+      setHashPathRaw(window.location.hash || '');
     };
-    syncInviteFromUrl();
-    window.addEventListener('hashchange', syncInviteFromUrl);
-    window.addEventListener('popstate', syncInviteFromUrl);
+    syncUrlState();
+    window.addEventListener('hashchange', syncUrlState);
+    window.addEventListener('popstate', syncUrlState);
     return () => {
-      window.removeEventListener('hashchange', syncInviteFromUrl);
-      window.removeEventListener('popstate', syncInviteFromUrl);
+      window.removeEventListener('hashchange', syncUrlState);
+      window.removeEventListener('popstate', syncUrlState);
     };
   }, []);
 
@@ -506,6 +518,14 @@ export default function App() {
   }, [phase, session?.email, location, navigate]);
 
   async function finalizeLogin(login: CompletedLogin) {
+    loginScopedBackupRepairAuthRef.current =
+      login.session.accessToken && (login.freshMasterPasswordHash || login.freshUserVerificationToken)
+        ? {
+            accessToken: login.session.accessToken,
+            masterPasswordHash: login.freshMasterPasswordHash || null,
+            userVerificationToken: login.freshUserVerificationToken || null,
+          }
+        : null;
     setSession(login.session);
     setProfile(login.profile);
     setUnlockPreparing(false);
@@ -639,19 +659,38 @@ export default function App() {
     }
   }
 
+  function handleSelectTotpProvider(providerType: number) {
+    if (totpSubmitting) return;
+    setPendingTotp((current) => {
+      if (!current || current.providerType === providerType) return current;
+      const canUseProvider = current.availableProviders.includes(providerType);
+      if (!canUseProvider) return current;
+      return {
+        ...current,
+        providerType,
+        providerData: current.providerDataByType[providerType],
+      };
+    });
+    setTotpCode('');
+  }
+
   async function handleTotpVerify() {
     if (totpSubmitting) return;
     if (!pendingTotp) return;
-    if (!totpCode.trim()) {
-      pushToast('error', t('txt_please_input_totp_code'));
+    const isPasskeyTwoFactor = pendingTotp.providerType === TWO_FACTOR_PROVIDER_WEBAUTHN;
+    if (!isPasskeyTwoFactor && !totpCode.trim()) {
+      pushToast('error', pendingTotp.providerType === TWO_FACTOR_PROVIDER_YUBIKEY ? t('txt_please_input_yubikey_otp') : t('txt_please_input_totp_code'));
       return;
     }
     setTotpSubmitting(true);
     try {
-      const login = await performTotpLogin(pendingTotp, totpCode, rememberDevice);
+      const token = isPasskeyTwoFactor
+        ? await assertTwoFactorPasskey(pendingTotp.providerData)
+        : totpCode;
+      const login = await performTotpLogin(pendingTotp, token, rememberDevice);
       await finalizeLogin(login);
     } catch (error) {
-      pushToast('error', error instanceof Error ? error.message : t('txt_totp_verify_failed'));
+      pushToast('error', error instanceof Error ? error.message : pendingTotp.providerType === 3 ? t('txt_yubikey_verify_failed') : isPasskeyTwoFactor ? t('txt_passkey_verification_failed') : t('txt_totp_verify_failed'));
     } finally {
       setTotpSubmitting(false);
     }
@@ -936,11 +975,14 @@ export default function App() {
         confirm={null}
         onCancelConfirm={() => {}}
         pendingTotpOpen={false}
+        pendingTotpProviderType={0}
+        pendingTotpAvailableProviders={[]}
         totpCode=""
         rememberDevice={false}
         onTotpCodeChange={() => {}}
         onRememberDeviceChange={() => {}}
         onConfirmTotp={() => {}}
+        onSelectTotpProvider={() => {}}
         onCancelTotp={() => {}}
         onUseRecoveryCode={() => {}}
         totpSubmitting={false}
@@ -1066,9 +1108,9 @@ export default function App() {
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && isAdmin && vaultInitialDecryptDone,
     staleTime: 30_000,
   });
-  const totpStatusQuery = useQuery({
-    queryKey: ['totp-status', vaultCacheKey || session?.email],
-    queryFn: () => getTotpStatus(authedFetch),
+  const twoFactorStatusQuery = useQuery({
+    queryKey: ['two-factor-status', vaultCacheKey || session?.email],
+    queryFn: () => getTwoFactorProviderStatus(authedFetch),
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && vaultInitialDecryptDone,
     staleTime: 30_000,
   });
@@ -1085,18 +1127,38 @@ export default function App() {
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && vaultInitialDecryptDone,
     staleTime: 30_000,
   });
+
+  async function deriveCurrentMasterPasswordHash(masterPassword: string): Promise<string> {
+    const email = String(profile?.email || session?.email || '').trim().toLowerCase();
+    if (!email) throw new Error(t('txt_profile_unavailable'));
+    const normalizedPassword = String(masterPassword || '');
+    if (!normalizedPassword) throw new Error(t('txt_master_password_is_required'));
+    const derived = await deriveLoginHash(email, normalizedPassword, defaultKdfIterations);
+    return derived.hash;
+  }
   const pendingAuthRequestsQueryKey = useMemo(() => ['auth-requests-pending', vaultCacheKey || session?.email] as const, [vaultCacheKey, session?.email]);
   const pendingAuthRequestsQuery = useQuery({
     queryKey: pendingAuthRequestsQueryKey,
     queryFn: () => listPendingAuthRequests(authedFetch, profile?.email || session?.email || ''),
     enabled: !IS_DEMO_MODE && phase === 'app' && !!session?.accessToken && !!session?.symEncKey && !!session?.symMacKey && !!(profile?.email || session?.email),
     staleTime: 5_000,
-    refetchInterval: 15_000,
-    refetchIntervalInBackground: true,
   });
   const pendingAuthRequests = (pendingAuthRequestsQuery.data || []).filter(isPendingAuthRequest);
   const latestPendingAuthRequest = pendingAuthRequests[0] || null;
-  const authRequestDialogOpen = !!latestPendingAuthRequest && latestPendingAuthRequest.id !== authRequestDialogDismissedId;
+  const selectedPendingAuthRequest = authRequestDialogSelectedId
+    ? pendingAuthRequests.find((request) => request.id === authRequestDialogSelectedId) || null
+    : null;
+  const authRequestDialogRequest = selectedPendingAuthRequest || (
+    latestPendingAuthRequest && latestPendingAuthRequest.id !== authRequestDialogDismissedId
+      ? latestPendingAuthRequest
+      : null
+  );
+  const authRequestDialogOpen = !!authRequestDialogRequest;
+
+  async function beginApproveAuthRequest(authRequest: AuthRequest): Promise<void> {
+    setAuthRequestDialogSelectedId(authRequest.id);
+    setAuthRequestDialogDismissedId(null);
+  }
 
   async function approveAuthRequest(authRequest: AuthRequest): Promise<void> {
     if (!session) throw new Error(t('txt_vault_key_unavailable'));
@@ -1105,11 +1167,11 @@ export default function App() {
       const key = await encryptSessionUserKeyForAuthRequest(session, authRequest);
       await respondToAuthRequest(authedFetch, authRequest.id, {
         key,
-        masterPasswordHash: null,
         deviceIdentifier: getCurrentDeviceIdentifier(),
         requestApproved: true,
       });
       setAuthRequestDialogDismissedId(null);
+      setAuthRequestDialogSelectedId(null);
       pushToast('success', t('txt_auth_request_approved'));
       await pendingAuthRequestsQuery.refetch();
     } finally {
@@ -1125,6 +1187,7 @@ export default function App() {
         requestApproved: false,
       });
       setAuthRequestDialogDismissedId(null);
+      setAuthRequestDialogSelectedId(null);
       pushToast('success', t('txt_auth_request_denied'));
       await pendingAuthRequestsQuery.refetch();
     } finally {
@@ -1189,13 +1252,25 @@ export default function App() {
     if (!isAdminProfile(profile)) return;
     if (repairAttemptRef.current === session.accessToken) return;
 
+    const loginScopedRepairAuth = loginScopedBackupRepairAuthRef.current?.accessToken === session.accessToken
+      ? loginScopedBackupRepairAuthRef.current
+      : null;
     repairAttemptRef.current = session.accessToken;
-    void silentlyRepairBackupSettingsIfNeeded(session, profile);
+    void (async () => {
+      try {
+        await silentlyRepairBackupSettingsIfNeeded(session, profile, loginScopedRepairAuth);
+      } finally {
+        if (loginScopedBackupRepairAuthRef.current?.accessToken === session.accessToken) {
+          loginScopedBackupRepairAuthRef.current = null;
+        }
+      }
+    })();
   }, [phase, session?.accessToken, session?.symEncKey, session?.symMacKey, profile, vaultInitialDecryptDone]);
 
   useEffect(() => {
     if (session?.accessToken) return;
     repairAttemptRef.current = '';
+    loginScopedBackupRepairAuthRef.current = null;
     uriChecksumRepairAttemptRef.current = '';
   }, [session?.accessToken]);
 
@@ -1767,7 +1842,7 @@ export default function App() {
     onNotify: pushToast,
     onProfileUpdated: setProfile,
     onSetConfirm: setConfirm,
-    refetchTotpStatus: totpStatusQuery.refetch,
+    refetchTwoFactorStatus: twoFactorStatusQuery.refetch,
     refetchAuthorizedDevices: authorizedDevicesQuery.refetch,
   });
   const adminActions = useAdminActions({
@@ -1788,7 +1863,6 @@ export default function App() {
     await pendingAuthRequestsQuery.refetch();
   };
 
-  const hashPathRaw = typeof window !== 'undefined' ? window.location.hash || '' : '';
   const hashPath = hashPathRaw.startsWith('#') ? hashPathRaw.slice(1) : hashPathRaw;
   const hashPathOnly = String(hashPath || '').split('?')[0].split('#')[0];
   const trimmedHashPath = hashPathOnly.replace(/^\/+/, '').replace(/\/+$/, '');
@@ -1890,6 +1964,7 @@ export default function App() {
     session,
     mobileLayout,
     mobileSidebarToggleKey,
+    themePreference,
     importRoute: IMPORT_ROUTE,
     settingsHomeRoute: SETTINGS_HOME_ROUTE,
     settingsAccountRoute: SETTINGS_ACCOUNT_ROUTE,
@@ -1904,10 +1979,13 @@ export default function App() {
     invites: invitesQuery.data || [],
     adminLoading: (usersQuery.isFetching && !usersQuery.data) || (invitesQuery.isFetching && !invitesQuery.data),
     adminError: usersQuery.isError || invitesQuery.isError ? t('txt_load_admin_data_failed') : '',
-    totpEnabled: !!totpStatusQuery.data?.enabled,
+    totpEnabled: !!twoFactorStatusQuery.data?.totpEnabled,
+    yubikeyEnabled: !!twoFactorStatusQuery.data?.yubikeyEnabled,
+    passkey2faEnabled: !!twoFactorStatusQuery.data?.passkeyEnabled,
     lockTimeoutMinutes,
     sessionTimeoutAction,
     authorizedDevices: authorizedDevicesQuery.data || [],
+    currentDeviceIdentifier: getCurrentDeviceIdentifier(),
     authorizedDevicesLoading: authorizedDevicesQuery.isFetching,
     authorizedDevicesError: authorizedDevicesQuery.isError && !authorizedDevicesQuery.data ? t('txt_load_devices_failed') : '',
     domainRules: IS_DEMO_MODE ? demoDomainRules : domainRulesQuery.data || null,
@@ -1916,6 +1994,7 @@ export default function App() {
     onNavigate: navigate,
     onLogout: handleLogout,
     onNotify: pushToast,
+    onThemePreferenceChange: setThemePreference,
     onImport: vaultSendActions.importVault,
     onImportEncryptedRaw: vaultSendActions.importEncryptedRaw,
     onExport: vaultSendActions.exportVault,
@@ -1950,11 +2029,20 @@ export default function App() {
     sendUploadPercent: vaultSendActions.sendUploadPercent,
     onChangePassword: accountSecurityActions.changePassword,
     onSavePasswordHint: accountSecurityActions.savePasswordHint,
-    onEnableTotp: async (secret: string, token: string) => {
-      await accountSecurityActions.enableTotp(secret, token);
-      await totpStatusQuery.refetch();
+    onEnableTotp: async (secret: string, token: string, masterPassword: string) => {
+      await accountSecurityActions.enableTotp(secret, token, masterPassword);
+      await twoFactorStatusQuery.refetch();
     },
     onOpenDisableTotp: () => setDisableTotpOpen(true),
+    onGetYubiKeySettings: accountSecurityActions.getYubiKeySettings,
+    onSaveYubiKeySettings: accountSecurityActions.saveYubiKeySettings,
+    onSaveYubiKeyApiCredentials: accountSecurityActions.saveYubiKeyApiCredentials,
+    onBootstrapYubiKeyApiCredentials: accountSecurityActions.bootstrapYubiKeyApiCredentials,
+    onDisableYubiKey: accountSecurityActions.disableYubiKey,
+    onGetTwoFactorPasskeySettings: accountSecurityActions.getTwoFactorPasskeySettings,
+    onCreateTwoFactorPasskey: accountSecurityActions.createTwoFactorPasskey,
+    onDeleteTwoFactorPasskey: accountSecurityActions.deleteTwoFactorPasskey,
+    onDisableTwoFactorPasskeys: accountSecurityActions.disableTwoFactorPasskeys,
     onGetRecoveryCode: accountSecurityActions.getRecoveryCode,
     onGetApiKey: accountSecurityActions.getApiKey,
     onRotateApiKey: accountSecurityActions.rotateApiKey,
@@ -1962,12 +2050,16 @@ export default function App() {
     onCreateAccountPasskey: accountSecurityActions.createAccountPasskey,
     onEnableAccountPasskeyDirectUnlock: accountSecurityActions.enableAccountPasskeyDirectUnlock,
     onDeleteAccountPasskey: accountSecurityActions.deleteAccountPasskey,
+    onRefreshTwoFactorStatus: async () => {
+      await twoFactorStatusQuery.refetch();
+    },
     pendingAuthRequests,
-    pendingAuthRequestsLoading: pendingAuthRequestsQuery.isFetching,
+    pendingAuthRequestsLoading: pendingAuthRequestsQuery.isLoading,
+    pendingAuthRequestsRefreshing: pendingAuthRequestsQuery.isFetching && !pendingAuthRequestsQuery.isLoading,
     onRefreshPendingAuthRequests: async () => {
       await pendingAuthRequestsQuery.refetch();
     },
-    onApproveAuthRequest: approveAuthRequest,
+    onApproveAuthRequest: beginApproveAuthRequest,
     onDenyAuthRequest: denyAuthRequest,
     onLockTimeoutChange: setLockTimeoutMinutes,
     onSessionTimeoutActionChange: setSessionTimeoutAction,
@@ -1980,34 +2072,70 @@ export default function App() {
     onRevokeDeviceTrust: accountSecurityActions.openRevokeDeviceTrust,
     onTrustDevicePermanently: accountSecurityActions.openTrustDevicePermanently,
     onRemoveDevice: accountSecurityActions.openRemoveDevice,
+    onRemoveSelectedDevices: accountSecurityActions.openRemoveSelectedDevices,
     onRevokeAllDeviceTrust: accountSecurityActions.openRevokeAllDeviceTrust,
     onRemoveAllDevices: accountSecurityActions.openRemoveAllDevices,
     onRefreshAdmin: adminActions.refreshAdmin,
     onCreateInvite: adminActions.createInvite,
+    onDeleteInvalidInvites: adminActions.deleteInvalidInvites,
     onDeleteAllInvites: adminActions.deleteAllInvites,
     onToggleUserStatus: adminActions.toggleUserStatus,
     onDeleteUser: adminActions.deleteUser,
-    onRevokeInvite: adminActions.revokeInvite,
+    onDeleteInvite: adminActions.deleteInvite,
     onLoadAuditLogs: (filters: AuditLogFilters) => listAuditLogs(authedFetch, filters),
     onLoadAuditLogSettings: () => getAuditLogSettings(authedFetch),
     onSaveAuditLogSettings: (settings: AuditLogSettings) => saveAuditLogSettings(authedFetch, settings),
     onClearAuditLogs: () => clearAuditLogs(authedFetch),
-    onExportBackup: backupActions.exportBackup,
-    onImportBackup: backupActions.importBackup,
-    onImportBackupAllowingChecksumMismatch: backupActions.importBackupAllowingChecksumMismatch,
+    onExportBackup: async (masterPassword: string, includeAttachments?: boolean) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.exportBackup(hash, includeAttachments);
+    },
+    onImportBackup: async (masterPassword: string, file: File, replaceExisting?: boolean) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.importBackup(hash, file, replaceExisting);
+    },
+    onImportBackupAllowingChecksumMismatch: async (masterPassword: string, file: File, replaceExisting?: boolean) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.importBackupAllowingChecksumMismatch(hash, file, replaceExisting);
+    },
     onLoadBackupSettings: () => queryClient.ensureQueryData({
       queryKey: ['admin-backup-settings', vaultCacheKey],
       queryFn: () => backupActions.loadSettings(),
       staleTime: 30_000,
     }),
-    onSaveBackupSettings: backupActions.saveSettings,
-    onRunRemoteBackup: backupActions.runRemoteBackup,
+    onSaveBackupSettings: async (masterPassword: string, settings: AdminBackupSettings) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      const saved = await backupActions.saveSettings(hash, settings);
+      queryClient.setQueryData(['admin-backup-settings', vaultCacheKey], saved);
+      return saved;
+    },
+    onRunRemoteBackup: async (masterPassword: string, destinationId?: string | null) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      const result = await backupActions.runRemoteBackup(hash, destinationId);
+      queryClient.setQueryData(['admin-backup-settings', vaultCacheKey], result.settings);
+      return result;
+    },
     onListRemoteBackups: backupActions.listRemoteBackups,
-    onDownloadRemoteBackup: backupActions.downloadRemoteBackup,
-    onInspectRemoteBackup: backupActions.inspectRemoteBackup,
-    onDeleteRemoteBackup: backupActions.deleteRemoteBackup,
-    onRestoreRemoteBackup: backupActions.restoreRemoteBackup,
-    onRestoreRemoteBackupAllowingChecksumMismatch: backupActions.restoreRemoteBackupAllowingChecksumMismatch,
+    onDownloadRemoteBackup: async (masterPassword: string, destinationId: string, path: string, onProgress?: (percent: number | null) => void) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.downloadRemoteBackup(hash, destinationId, path, onProgress);
+    },
+    onInspectRemoteBackup: async (masterPassword: string, destinationId: string, path: string) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.inspectRemoteBackup(hash, destinationId, path);
+    },
+    onDeleteRemoteBackup: async (masterPassword: string, destinationId: string, path: string) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.deleteRemoteBackup(hash, destinationId, path);
+    },
+    onRestoreRemoteBackup: async (masterPassword: string, destinationId: string, path: string, replaceExisting?: boolean) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.restoreRemoteBackup(hash, destinationId, path, replaceExisting);
+    },
+    onRestoreRemoteBackupAllowingChecksumMismatch: async (masterPassword: string, destinationId: string, path: string, replaceExisting?: boolean) => {
+      const hash = await deriveCurrentMasterPasswordHash(masterPassword);
+      return backupActions.restoreRemoteBackupAllowingChecksumMismatch(hash, destinationId, path, replaceExisting);
+    },
   };
   const effectiveMainRoutesProps = IS_DEMO_MODE
     ? createDemoMainRoutesProps(mainRoutesProps, pushToast, {
@@ -2125,11 +2253,14 @@ export default function App() {
           confirm={confirm}
           onCancelConfirm={() => setConfirm(null)}
           pendingTotpOpen={!!pendingTotp}
+          pendingTotpProviderType={pendingTotp?.providerType ?? 0}
+          pendingTotpAvailableProviders={pendingTotp?.availableProviders ?? []}
           totpCode={totpCode}
           rememberDevice={rememberDevice}
           onTotpCodeChange={setTotpCode}
           onRememberDeviceChange={setRememberDevice}
           onConfirmTotp={() => void handleTotpVerify()}
+          onSelectTotpProvider={handleSelectTotpProvider}
           onCancelTotp={() => {
             if (totpSubmitting) return;
             setPendingTotp(null);
@@ -2184,11 +2315,14 @@ export default function App() {
         confirm={confirm}
         onCancelConfirm={() => setConfirm(null)}
         pendingTotpOpen={false}
+        pendingTotpProviderType={0}
+        pendingTotpAvailableProviders={[]}
         totpCode=""
         rememberDevice={false}
         onTotpCodeChange={() => {}}
         onRememberDeviceChange={() => {}}
         onConfirmTotp={() => {}}
+        onSelectTotpProvider={() => {}}
         onCancelTotp={() => {}}
         onUseRecoveryCode={() => {}}
         totpSubmitting={false}
@@ -2215,21 +2349,24 @@ export default function App() {
       />
       <AuthRequestApprovalDialog
         open={authRequestDialogOpen}
-        authRequest={latestPendingAuthRequest}
+        authRequest={authRequestDialogRequest}
         submitting={!!authRequestSubmittingId}
         onApprove={() => {
-          if (!latestPendingAuthRequest) return;
-          void approveAuthRequest(latestPendingAuthRequest).catch((error) => {
+          if (!authRequestDialogRequest) return;
+          void approveAuthRequest(authRequestDialogRequest).catch((error) => {
             pushToast('error', error instanceof Error ? error.message : t('txt_auth_request_update_failed'));
           });
         }}
         onDeny={() => {
-          if (!latestPendingAuthRequest) return;
-          void denyAuthRequest(latestPendingAuthRequest).catch((error) => {
+          if (!authRequestDialogRequest) return;
+          void denyAuthRequest(authRequestDialogRequest).catch((error) => {
             pushToast('error', error instanceof Error ? error.message : t('txt_auth_request_update_failed'));
           });
         }}
-        onClose={() => setAuthRequestDialogDismissedId(latestPendingAuthRequest?.id || null)}
+        onClose={() => {
+          setAuthRequestDialogSelectedId(null);
+          setAuthRequestDialogDismissedId(authRequestDialogRequest?.id || null);
+        }}
       />
     </>
   );

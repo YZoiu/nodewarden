@@ -26,7 +26,9 @@ import {
 } from '../../shared/backup-schema';
 
 export const BACKUP_SETTINGS_CONFIG_KEY = 'backup.settings.v1';
+const BACKUP_RUNTIME_CONFIG_KEY = 'backup.runtime.v1';
 export const BACKUP_SCHEDULER_WINDOW_MINUTES = 5;
+export const REDACTED_BACKUP_SECRET = '********';
 const MAX_BACKUP_DESTINATIONS = 24;
 
 export type {
@@ -64,6 +66,114 @@ function asTrimmedString(value: unknown): string {
 
 function normalizePath(value: unknown): string {
   return asTrimmedString(value).replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+}
+
+function normalizeHostnameForPolicy(hostname: string): string {
+  return hostname.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+}
+
+function parseIpv4Address(hostname: string): number[] | null {
+  const parts = hostname.split('.');
+  if (parts.length !== 4) return null;
+  const octets = parts.map((part) => {
+    if (!/^\d{1,3}$/.test(part)) return -1;
+    const value = Number(part);
+    return Number.isInteger(value) && value >= 0 && value <= 255 ? value : -1;
+  });
+  return octets.every((value) => value >= 0) ? octets : null;
+}
+
+function isBlockedIpv4Address(octets: number[]): boolean {
+  const [a, b, c] = octets;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && (b === 0 || b === 168)) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
+}
+
+function isBlockedIpv6Address(hostname: string): boolean {
+  if (!hostname.includes(':')) return false;
+  const normalized = hostname.toLowerCase();
+  const mappedIpv4 = normalized.match(/::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (mappedIpv4) {
+    const octets = parseIpv4Address(mappedIpv4[1]);
+    return !octets || isBlockedIpv4Address(octets);
+  }
+  const firstHextetText = normalized.split(':').find((part) => part.length > 0) || '0';
+  const firstHextet = Number.parseInt(firstHextetText, 16);
+  if (!Number.isFinite(firstHextet)) return true;
+  return (
+    firstHextet === 0 ||
+    (firstHextet & 0xfe00) === 0xfc00 ||
+    (firstHextet & 0xffc0) === 0xfe80 ||
+    (firstHextet & 0xff00) === 0xff00 ||
+    normalized.startsWith('2001:db8:')
+  );
+}
+
+function assertBackupEndpointHostAllowed(hostname: string, label: string): void {
+  const normalized = normalizeHostnameForPolicy(hostname);
+  if (!normalized) throw new Error(`${label} host is required`);
+  if (
+    normalized === 'localhost' ||
+    normalized === 'localhost.localdomain' ||
+    normalized.endsWith('.localhost.localdomain') ||
+    normalized.endsWith('.localhost') ||
+    normalized.endsWith('.local') ||
+    normalized.endsWith('.home.arpa') ||
+    normalized.endsWith('.internal') ||
+    normalized.endsWith('.lan') ||
+    normalized === 'metadata.google.internal' ||
+    normalized === 'localtest.me' ||
+    normalized.endsWith('.localtest.me') ||
+    normalized === 'lvh.me' ||
+    normalized.endsWith('.lvh.me') ||
+    normalized === 'vcap.me' ||
+    normalized.endsWith('.vcap.me') ||
+    normalized === 'nip.io' ||
+    normalized.endsWith('.nip.io') ||
+    normalized === 'sslip.io' ||
+    normalized.endsWith('.sslip.io') ||
+    normalized === 'xip.io' ||
+    normalized.endsWith('.xip.io')
+  ) {
+    throw new Error(`${label} host is not allowed`);
+  }
+  const ipv4 = parseIpv4Address(normalized);
+  if (ipv4 && isBlockedIpv4Address(ipv4)) {
+    throw new Error(`${label} host is not allowed`);
+  }
+  if (isBlockedIpv6Address(normalized)) {
+    throw new Error(`${label} host is not allowed`);
+  }
+}
+
+export function normalizeBackupEndpointUrl(value: string, label: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid URL`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`${label} must start with http:// or https://`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${label} must not include credentials`);
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(`${label} must not include query or fragment`);
+  }
+  assertBackupEndpointHostAllowed(parsed.hostname, label);
+  return parsed.toString().replace(/\/+$/, '');
 }
 
 function assertValidTimeZone(timezone: string): string {
@@ -121,7 +231,7 @@ function normalizeS3Destination(value: unknown, allowIncomplete = false): S3Back
 
   if (!allowIncomplete || endpoint) {
     if (!endpoint) throw new Error('S3 endpoint is required');
-    if (!/^https?:\/\//i.test(endpoint)) throw new Error('S3 endpoint must start with http:// or https://');
+    normalizeBackupEndpointUrl(endpoint, 'S3 endpoint');
   }
   if (!allowIncomplete || bucket) {
     if (!bucket) throw new Error('S3 bucket is required');
@@ -134,7 +244,7 @@ function normalizeS3Destination(value: unknown, allowIncomplete = false): S3Back
   }
 
   return {
-    endpoint: endpoint ? endpoint.replace(/\/+$/, '') : '',
+    endpoint: endpoint ? normalizeBackupEndpointUrl(endpoint, 'S3 endpoint') : '',
     bucket,
     addressingStyle,
     region,
@@ -153,7 +263,7 @@ function normalizeWebDavDestination(value: unknown, allowIncomplete = false): We
 
   if (!allowIncomplete || baseUrl) {
     if (!baseUrl) throw new Error('WebDAV server URL is required');
-    if (!/^https?:\/\//i.test(baseUrl)) throw new Error('WebDAV server URL must start with http:// or https://');
+    normalizeBackupEndpointUrl(baseUrl, 'WebDAV server URL');
   }
   if (!allowIncomplete || username) {
     if (!username) throw new Error('WebDAV username is required');
@@ -163,7 +273,7 @@ function normalizeWebDavDestination(value: unknown, allowIncomplete = false): We
   }
 
   return {
-    baseUrl: baseUrl ? baseUrl.replace(/\/+$/, '') : '',
+    baseUrl: baseUrl ? normalizeBackupEndpointUrl(baseUrl, 'WebDAV server URL') : '',
     username,
     password,
     remotePath,
@@ -177,6 +287,32 @@ function normalizeDestination(
 ): BackupDestinationConfig {
   if (destinationType === 's3') return normalizeS3Destination(destination, allowIncomplete);
   return normalizeWebDavDestination(destination, allowIncomplete);
+}
+
+function shouldPreserveBackupSecret(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  const raw = String(value);
+  return raw === '' || raw === REDACTED_BACKUP_SECRET;
+}
+
+function withPreservedDestinationSecret(
+  destinationType: BackupDestinationType,
+  inputDestination: unknown,
+  previous: BackupDestinationRecord | undefined
+): unknown {
+  const source = isPlainObject(inputDestination) ? { ...inputDestination } : {};
+  if (destinationType === 's3') {
+    const previousDestination = previous?.type === 's3' ? previous.destination as S3BackupDestination : null;
+    if (shouldPreserveBackupSecret(source.secretAccessKey)) {
+      source.secretAccessKey = previousDestination?.secretAccessKey || '';
+    }
+  } else {
+    const previousDestination = previous?.type === 'webdav' ? previous.destination as WebDavBackupDestination : null;
+    if (shouldPreserveBackupSecret(source.password)) {
+      source.password = previousDestination?.password || '';
+    }
+  }
+  return source;
 }
 
 function normalizeRuntime(value: unknown): BackupRuntimeState {
@@ -249,7 +385,11 @@ function normalizeDestinationRecord(
     retentionCount: normalizeRetentionCount(retentionSource, previousSchedule.retentionCount),
   };
 
-  const destination = normalizeDestination(type, input.destination, !schedule.enabled);
+  const destination = normalizeDestination(
+    type,
+    withPreservedDestinationSecret(type, input.destination, previous),
+    !schedule.enabled
+  );
 
   return {
     id,
@@ -324,6 +464,47 @@ function mapDestinationsById(destinations: BackupDestinationRecord[]): Map<strin
   return new Map(destinations.map((destination) => [destination.id, destination]));
 }
 
+function stripRuntimeFromSettings(settings: BackupSettings): BackupSettings {
+  return {
+    destinations: settings.destinations.map((destination) => ({
+      ...destination,
+      runtime: normalizeRuntime(null),
+    })),
+  };
+}
+
+function serializeRuntimeState(settings: BackupSettings): string {
+  return JSON.stringify({
+    version: 1,
+    destinations: Object.fromEntries(
+      settings.destinations.map((destination) => [destination.id, normalizeRuntime(destination.runtime)])
+    ),
+  });
+}
+
+async function loadBackupRuntimeStates(storage: StorageService): Promise<Map<string, BackupRuntimeState>> {
+  const raw = await storage.getConfigValue(BACKUP_RUNTIME_CONFIG_KEY);
+  if (!raw) return new Map();
+  try {
+    const parsed = JSON.parse(raw) as { destinations?: Record<string, unknown> };
+    const entries = Object.entries(parsed.destinations || {})
+      .filter(([id]) => !!asTrimmedString(id))
+      .map(([id, runtime]) => [id, normalizeRuntime(runtime)] as const);
+    return new Map(entries);
+  } catch {
+    return new Map();
+  }
+}
+
+function mergeRuntimeStates(settings: BackupSettings, runtimes: Map<string, BackupRuntimeState>): BackupSettings {
+  return {
+    destinations: settings.destinations.map((destination) => ({
+      ...destination,
+      runtime: runtimes.get(destination.id) || normalizeRuntime(destination.runtime),
+    })),
+  };
+}
+
 export function getDefaultBackupSettings(timezone: string = 'UTC'): BackupSettings {
   return createSharedDefaultBackupSettings(assertValidTimeZone(timezone));
 }
@@ -387,27 +568,55 @@ export function normalizeBackupSettingsInput(
 }
 
 export function serializeBackupSettings(settings: BackupSettings): string {
-  return JSON.stringify(settings);
+  return JSON.stringify(stripRuntimeFromSettings(settings));
+}
+
+export function redactBackupSettingsSecrets(settings: BackupSettings): BackupSettings {
+  return {
+    destinations: settings.destinations.map((destination) => {
+      if (destination.type === 's3') {
+        const config = destination.destination as S3BackupDestination;
+        return {
+          ...destination,
+          destination: {
+            ...config,
+            secretAccessKey: config.secretAccessKey ? REDACTED_BACKUP_SECRET : '',
+          },
+        };
+      }
+      const config = destination.destination as WebDavBackupDestination;
+      return {
+        ...destination,
+        destination: {
+          ...config,
+          password: config.password ? REDACTED_BACKUP_SECRET : '',
+        },
+      };
+    }),
+  };
 }
 
 export async function loadBackupSettings(storage: StorageService, env: Env, fallbackTimezone: string = 'UTC'): Promise<BackupSettings> {
   const raw = await storage.getConfigValue(BACKUP_SETTINGS_CONFIG_KEY);
+  const mergeRuntime = async (settings: BackupSettings): Promise<BackupSettings> => (
+    mergeRuntimeStates(settings, await loadBackupRuntimeStates(storage))
+  );
   if (!raw) {
     const settings = getDefaultBackupSettings(fallbackTimezone);
     await saveBackupSettings(storage, env, settings);
-    return settings;
+    return mergeRuntime(settings);
   }
 
   const envelope = parseBackupSettingsEnvelope(raw);
   if (!envelope) {
     const settings = parseBackupSettings(raw, fallbackTimezone);
     await saveBackupSettings(storage, env, settings);
-    return settings;
+    return mergeRuntime(settings);
   }
 
   try {
     const decrypted = await decryptBackupSettingsRuntime(raw, env);
-    return parseBackupSettings(decrypted, fallbackTimezone);
+    return mergeRuntime(parseBackupSettings(decrypted, fallbackTimezone));
   } catch {
     throw new Error('Backup settings need administrator reactivation after restore');
   }
@@ -417,6 +626,27 @@ export async function saveBackupSettings(storage: StorageService, env: Env, sett
   const users = await storage.getAllUsers();
   const encrypted = await encryptBackupSettingsEnvelope(serializeBackupSettings(settings), env, users);
   await storage.setConfigValue(BACKUP_SETTINGS_CONFIG_KEY, encrypted);
+  await saveBackupRuntimeStates(storage, settings);
+}
+
+export async function saveBackupRuntimeStates(storage: StorageService, settings: BackupSettings): Promise<void> {
+  await storage.setConfigValue(BACKUP_RUNTIME_CONFIG_KEY, serializeRuntimeState(settings));
+}
+
+export async function updateBackupDestinationRuntime(
+  storage: StorageService,
+  destinationId: string,
+  mutator: (runtime: BackupRuntimeState) => BackupRuntimeState
+): Promise<BackupRuntimeState> {
+  const runtimes = await loadBackupRuntimeStates(storage);
+  const current = runtimes.get(destinationId) || normalizeRuntime(null);
+  const next = normalizeRuntime(mutator(current));
+  runtimes.set(destinationId, next);
+  await storage.setConfigValue(BACKUP_RUNTIME_CONFIG_KEY, JSON.stringify({
+    version: 1,
+    destinations: Object.fromEntries(runtimes.entries()),
+  }));
+  return next;
 }
 
 export async function normalizeImportedBackupSettings(storage: StorageService, env: Env, fallbackTimezone: string = 'UTC'): Promise<void> {
@@ -596,9 +826,9 @@ export function hasBackupSlotBetween(
   const endMs = endExclusive.getTime();
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return false;
 
-  const lastAttemptAt = destination.runtime.lastAttemptAt ? new Date(destination.runtime.lastAttemptAt) : null;
-  const lastAttemptMs = lastAttemptAt && Number.isFinite(lastAttemptAt.getTime())
-    ? lastAttemptAt.getTime()
+  const lastSuccessAt = destination.runtime.lastSuccessAt ? new Date(destination.runtime.lastSuccessAt) : null;
+  const lastSuccessMs = lastSuccessAt && Number.isFinite(lastSuccessAt.getTime())
+    ? lastSuccessAt.getTime()
     : Number.NEGATIVE_INFINITY;
 
   const dayCursor = new Date(startMs);
@@ -620,7 +850,7 @@ export function hasBackupSlotBetween(
       for (const slotStart of slotStarts) {
         const slotStartMs = slotStart.getTime();
         if (slotStartMs < startMs || slotStartMs >= endMs) continue;
-        if (lastAttemptMs >= slotStartMs) continue;
+        if (lastSuccessMs >= slotStartMs) continue;
         return true;
       }
     }
@@ -637,9 +867,9 @@ export function isBackupDueNow(
 ): boolean {
   if (!destination.schedule.enabled) return false;
   const toleranceMs = Math.max(1, windowMinutes) * 60 * 1000;
-  const lastAttemptAt = destination.runtime.lastAttemptAt ? new Date(destination.runtime.lastAttemptAt) : null;
-  const lastAttemptMs = lastAttemptAt && Number.isFinite(lastAttemptAt.getTime())
-    ? lastAttemptAt.getTime()
+  const lastSuccessAt = destination.runtime.lastSuccessAt ? new Date(destination.runtime.lastSuccessAt) : null;
+  const lastSuccessMs = lastSuccessAt && Number.isFinite(lastSuccessAt.getTime())
+    ? lastSuccessAt.getTime()
     : Number.NEGATIVE_INFINITY;
   const localDateKey = getBackupLocalDateKey(now, destination.schedule.timezone);
   const slotStarts = getBackupSlotStartsForLocalDay(
@@ -652,7 +882,7 @@ export function isBackupDueNow(
   for (const slotStart of slotStarts) {
     const slotStartMs = slotStart.getTime();
     if (now.getTime() < slotStartMs || now.getTime() >= slotStartMs + toleranceMs) continue;
-    if (lastAttemptMs >= slotStartMs) return false;
+    if (lastSuccessMs >= slotStartMs) return false;
     return true;
   }
   return false;

@@ -1,0 +1,96 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Daily at 02:00 UTC (about 10:00 Beijing time)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/shuaiplus/NodeWarden.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "already_up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "Fork already contains upstream/main"
+            exit 0
+          fi
+
+          echo "already_up_to_date=false" >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit upstream/main; then
+            echo "merge_clean=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Merge reported conflicts; attempting wrangler-only recovery"
+
+          mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
+          if [ "${#conflicted[@]}" -eq 0 ]; then
+            echo "Merge failed without listed conflict files"
+            git status
+            exit 1
+          fi
+
+          other=()
+          for f in "${conflicted[@]}"; do
+            if [ "$f" != "wrangler.toml" ]; then
+              other+=("$f")
+            fi
+          done
+
+          if [ "${#other[@]}" -gt 0 ]; then
+            echo "Conflicts outside wrangler.toml; needs manual fix:"
+            printf '  - %s\n' "${other[@]}"
+            exit 1
+          fi
+
+          # Prefer upstream wrangler as base; fork overrides re-applied next.
+          git show upstream/main:wrangler.toml > wrangler.toml
+          git add wrangler.toml
+          git commit --no-edit
+          echo "merge_clean=false" >> "$GITHUB_OUTPUT"
+
+      - name: Re-apply fork wrangler overrides
+        run: python3 .github/scripts/apply-fork-wrangler-overrides.py
+
+      - name: Commit overrides if needed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- wrangler.toml; then
+            echo "No wrangler override commit needed"
+            exit 0
+          fi
+          git add wrangler.toml
+          git commit -m "chore: re-apply fork wrangler overrides after upstream sync"
+          echo "Committed fork wrangler overrides"
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          git push origin HEAD:${{ github.ref_name }}
